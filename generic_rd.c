@@ -3,6 +3,8 @@
 #include <math.h>
 #include <netcdf.h>
 #include <gsl/gsl_interp.h>
+#include <time.h>
+#include <string.h>
 
 /* Handle errors by printing an error message and exiting with a
  * non-zero status. */
@@ -65,9 +67,9 @@
     };                                                                          \
     break;
 
-#define K 20                       // Interval size
-#define WIN_SIZE (2 * K) + 1       // Window size
-#define WIN_SIZE_MINUS (2 * K) - 1 // Maximum size of interpolation range
+#define K 20                     // Interval size
+#define WINDOW (2 * K) + 1       // Window size
+#define WINDOW_MINUS (2 * K) - 1 // Maximum size of interpolation range
 
 #define IF_ISNAN(TYPE)                                                    \
     case TYPE:                                                            \
@@ -87,7 +89,7 @@
         }                                                                 \
         if (d_time[0] && !d_time[1])                                      \
         {                                                                 \
-            if (count > WIN_SIZE_MINUS)                                   \
+            if (count > WINDOW_MINUS)                                     \
             {                                                             \
                 count = 0;                                                \
                 d_time[0] = 0;                                            \
@@ -129,6 +131,38 @@
     };                                                                      \
     break;
 
+#define DATE_ISO_INIT "2017-01-01T00:00:00" // format "YYYY-MM-DDTHH:MM:00"
+#define DATE_ISO_END "2017-12-31T00:00:00"  // format "YYYY-MM-DDTHH:MM:00"
+
+#define MONACHE(TYPE)                                                     \
+    case TYPE:                                                            \
+    {                                                                     \
+        for (int x = 0; x < WINDOW; x++)                                  \
+        {                                                                 \
+            double diff =                                                 \
+                ((TYPE_VAR_##TYPE *)data[i].values)[(forecast - K) + x] - \
+                ((TYPE_VAR_##TYPE *)data[i].values)[(analog - K) + x];    \
+            sum += diff * diff;                                           \
+        }                                                                 \
+    };                                                                    \
+    break;
+
+#define N_NEIGHBORS 25
+
+typedef struct Kdtree
+{
+    unsigned int window_id;
+    struct Kdtree *left;
+    struct Kdtree *right;
+} Kdtree;
+
+// Definindo a estrutura para armazenar um ponto com sua distância
+typedef struct
+{
+    unsigned int window_id;
+    double distance;
+} NearPoint;
+
 typedef struct
 {
     char field[NC_MAX_NAME + 1];
@@ -157,17 +191,38 @@ void print_available_data(BaseApp *, int);
 void print_data(BaseApp *, int);
 void count_data_unavailable(BaseApp *, int);
 void interp_data(BaseApp *, int);
+time_t convert_iso_to_time(char *);
+int binary_search(BaseApp *, int);
+double monacheMetric(VarData *, int, int, int, int);
+void process_data_kdtree(BaseApp *, int, int, int);
+void process_data_brute_force(BaseApp *, int, int, int);
+Kdtree *create_kdt_node(float);
+Kdtree *insert_kdt_node(Kdtree *, float *, int, int);
+void deallocate_kdtree(Kdtree *);
+double euclidean_distance(Kdtree *, float *, int, int);
+int compare_near_point(const void *, const void *);
+void search_nearest_points(float *, Kdtree *, int, int, NearPoint *, int *);
 
 int main(int argc, char *argv[])
 {
+    int time_init = 0,
+        time_end = 0;
+    // time_init = convert_iso_to_time(DATE_ISO_INIT);
+    // time_end = convert_iso_to_time(DATE_ISO_END);
     BaseApp *data = create_base_reconstruction(argc, &argv[0]);
+    time_init = binary_search(data, convert_iso_to_time(DATE_ISO_INIT));
+    time_end = binary_search(data, convert_iso_to_time(DATE_ISO_END));
 
+    printf("time_init: %i\n", time_init);
+    printf("time_end: %i\n", time_end);
     // print_io_netcdf_test(data);
     count_data_unavailable(data, argc);
-    print_available_data(data, argc);
+    // print_available_data(data, argc);
     interp_data(data, argc);
     count_data_unavailable(data, argc);
-    print_available_data(data, argc);
+    // process_data_kdtree(data, argc, time_init, time_end);
+    // process_data_brute_force(data, argc, time_init, time_end);
+    // print_available_data(data, argc);
     // print_data(data, argc);
 
     deallocate_memory(data, argc, &argv[0]);
@@ -571,4 +626,339 @@ void interp_data(BaseApp *file, int argc)
     // free resorcer
     gsl_interp_free(interp);
     gsl_interp_accel_free(acc);
+}
+
+time_t convert_iso_to_time(char *rawtime)
+{
+    struct tm time_info;
+    memset(&time_info, 0, sizeof(struct tm));
+
+    // Convert an ISO 8601 string to struct tm
+    if (sscanf(rawtime, "%4d-%2d-%2dT%2d:%2d:%2d",
+               &time_info.tm_year, &time_info.tm_mon, &time_info.tm_mday,
+               &time_info.tm_hour, &time_info.tm_min, &time_info.tm_sec) != 6)
+    {
+        printf("Error converting ISO 8601 string.\n");
+        return -1; // Conversion error
+    }
+
+    // Adjust the values ​​of the tm struct for the mktime function
+    time_info.tm_year -= 1900; // Year since 1900
+    time_info.tm_mon -= 1;     // Months 0 to 11
+
+    return mktime(&time_info) / 60; // Convert struct tm to time_t
+}
+
+int binary_search(BaseApp *file, int target)
+{
+    int *values = file[0].data[0].values;
+
+    int init = 0, end = file[0].var_len - 1;
+
+    while (init <= end)
+    {
+        int middle = init + (end - init) / 2;
+
+        if (values[middle] == target)
+            return middle;
+
+        if (values[middle] < target)
+            init = middle + 1;
+
+        else
+            end = middle - 1;
+    }
+
+    return -1;
+}
+
+double monacheMetric(VarData *data, int forecast, int analog, int t_init, int i)
+{
+    double sum = 0.0;
+    int flag = 0;
+
+    switch (data[i].type)
+    {
+        MONACHE(NC_BYTE);
+        MONACHE(NC_CHAR);
+        MONACHE(NC_SHORT);
+        MONACHE(NC_INT);
+        MONACHE(NC_FLOAT);
+        MONACHE(NC_DOUBLE);
+        MONACHE(NC_UBYTE);
+        MONACHE(NC_USHORT);
+        MONACHE(NC_UINT);
+        MONACHE(NC_INT64);
+        MONACHE(NC_UINT64);
+    }
+
+    return sqrt(sum);
+}
+
+// Function to create a new node in the Kdtree
+Kdtree *create_kdt_node(float window_id)
+{
+    Kdtree *node = (Kdtree *)malloc(sizeof(Kdtree));
+    node->window_id = window_id;
+    node->left = NULL;
+    node->right = NULL;
+    return node;
+}
+
+// Function to insert a new point in the Kdtree
+Kdtree *insert_kdt_node(Kdtree *root, float *values, int window_id, int depth)
+{
+    if (root == NULL)
+        return create_kdt_node(window_id);
+
+    int axis = depth % WINDOW; // Set axis based on depth
+
+    // Compare if window axis is greater than stored value.
+    if (values[(window_id - K) + axis] <
+        values[(root->window_id - K) + axis])
+        root->left = insert_kdt_node(root->left, values, window_id, depth + 1);
+    else
+        root->right = insert_kdt_node(root->right, values, window_id, depth + 1);
+
+    return root;
+}
+
+// free memory kdtree
+void deallocate_kdtree(Kdtree *root)
+{
+    if (root == NULL)
+        return;
+
+    deallocate_kdtree(root->left);
+    deallocate_kdtree(root->right);
+    free(root);
+}
+
+// Function to calculate euclidean distance (monache)
+double euclidean_distance(Kdtree *root, float *values, int window_id, int target_id)
+{
+    double sum = 0.0;
+    for (int i = 0; i < WINDOW; i++)
+    {
+        double diff =
+            (float)values[(target_id - K) + i] -
+            (float)values[(root->window_id - K) + i];
+        sum += diff * diff;
+    }
+
+    return sqrt(sum);
+}
+
+// Function to compare distances for heap
+int compare_near_point(const void *x, const void *y)
+{
+    NearPoint *point1 = (NearPoint *)x;
+    NearPoint *point2 = (NearPoint *)y;
+
+    if (point1->distance < point2->distance)
+        return 1;
+    if (point1->distance > point2->distance)
+        return -1;
+    return 0;
+}
+
+// Function ro search the n nearest points
+void search_nearest_points(float *values, Kdtree *root, int target_id, int depth, NearPoint *nearest, int *found)
+{
+    if (root == NULL)
+        return;
+
+    int axis = depth % WINDOW; // Set axis based on depth
+
+    double distance = euclidean_distance(root, values, root->window_id, target_id);
+
+    if (!isnan(distance))
+    {
+        if (*found < N_NEIGHBORS)
+        {
+            nearest[*found].window_id = root->window_id;
+            nearest[*found].distance = distance;
+            (*found)++;
+            if (*found == N_NEIGHBORS)
+                qsort(nearest, N_NEIGHBORS, sizeof(NearPoint), compare_near_point);
+        }
+        else if (distance < nearest[0].distance)
+        {
+            nearest[0].window_id = root->window_id;
+            nearest[0].distance = distance;
+            qsort(nearest, N_NEIGHBORS, sizeof(NearPoint), compare_near_point);
+        }
+    }
+
+    Kdtree *next = NULL;
+    Kdtree *other = NULL;
+    // Compare if window axis is greater than stored value.
+    if (values[(target_id - K) + axis] < values[(root->window_id - K) + axis])
+    {
+        next = root->left;
+        other = root->right;
+    }
+    else
+    {
+        next = root->right;
+        other = root->left;
+    }
+
+    // search_nearest_points(values, root->left, target_id, depth + 1, nearest, found);
+    // search_nearest_points(values, root->right, target_id, depth + 1, nearest, found);
+    search_nearest_points(values, next, target_id, depth + 1, nearest, found);
+
+    if (*found < N_NEIGHBORS || fabs(values[(target_id - K) + axis] -
+                                     values[(root->window_id - K) + axis]) < nearest[0].distance)
+        search_nearest_points(values, other, target_id, depth + 1, nearest, found);
+    // printf("distance: %.2lf\n", distance);
+}
+
+void process_data_kdtree(BaseApp *file, int argc, int t_init, int t_end)
+{
+    float *predictor_s = NULL;
+    float *predicted_s = NULL;
+
+    if (file == NULL || file[0].data == NULL)
+    {
+        printf("Err: process_data: No data to print for this file.\n");
+        return;
+    }
+
+    for (int i = 1; i - 1 < file[0].nvars - 13; i++)
+    {
+        for (int f = 0; f < (argc - 1); f++)
+        {
+            int count = 0;
+            if (f == 0)
+            {
+                if (predicted_s == NULL)
+                {
+                    predicted_s = file[f].data[i].values;
+                    continue;
+                }
+                continue;
+            }
+
+            predictor_s = (float *)file[f].data[i].values;
+
+            // printf("%i ", (int)file[f].data[i].nvar_unavailable);
+            if ( //(int)file[f].data[i].nvar_unavailable != 0
+                (int)file[f].data[i].nvar_unavailable >= 85 &&
+                (int)file[f].data[i].nvar_unavailable != 100)
+            {
+                Kdtree *root = NULL;
+                for (int analog = K; analog < t_init; analog++)
+                {
+                    root = insert_kdt_node(root, predictor_s, analog, 0);
+                }
+
+                for (int forecast = t_init; forecast <= t_end /*t_init + 2000*/; forecast++)
+                {
+                    int found = 0;
+                    NearPoint *nearest = (NearPoint *)malloc(N_NEIGHBORS * sizeof(NearPoint));
+                    search_nearest_points(predictor_s, root, forecast, 0, nearest, &found);
+
+                    printf("------------------------------------------------------------------\n");
+                    printf("Posição: %i\n", forecast);
+
+                    for (int i = 0; i < found; i++)
+                    {
+                        // printf("Ponto (");
+                        // for (int j = (nearest[i].window_id - K); j < WINDOW; j++)
+                        // {
+                        //     printf("%.2f, ", (predictor_s)[j]);
+                        //     if (j % 10 == 0)
+                        //         printf("\n");
+                        // }
+                        // printf(") com distância %.2f\n", nearest[i].distance);
+                        printf("| P%i W_ID: %i D: %.2f ", i, nearest[i].window_id, nearest[i].distance);
+                    }
+                    printf("\n");
+
+                    // for (int i = 0; i < N_NEIGHBORS; i++)
+                    // {
+                    //     nearest[i].window_id = 0;
+                    //     nearest[i].distance = 0.0;
+                    // }
+                    free(nearest);
+                }
+
+                deallocate_kdtree(root);
+            }
+            predicted_s = NULL;
+            predictor_s = NULL;
+        }
+    }
+}
+
+void process_data_brute_force(BaseApp *file, int argc, int t_init, int t_end)
+{
+    VarData *predictor_s = NULL;
+    VarData *predicted_s = NULL;
+
+    if (file == NULL || file[0].data == NULL)
+    {
+        printf("Err: process_data: No data to print for this file.\n");
+        return;
+    }
+
+    for (int i = 1; i - 1 < file[0].nvars - 13; i++)
+    {
+        for (int f = 0; f < (argc - 1); f++)
+        {
+            int count = 0;
+            if (f == 0)
+            {
+                predicted_s = file[f].data;
+                continue;
+            }
+
+            predictor_s = file[f].data;
+
+            // printf("%i ", (int)file[f].data[i].nvar_unavailable);
+            if ((int)file[f].data[i].nvar_unavailable >= 85 &&
+                (int)file[f].data[i].nvar_unavailable != 100)
+            {
+                for (int forecast = t_init; forecast <= t_end /*t_init + 2000*/; forecast++)
+                {
+                    int found = 0;
+                    NearPoint *nearest = (NearPoint *)malloc(N_NEIGHBORS * sizeof(NearPoint));
+                    for (int analog = K; analog < t_init; analog++)
+                    {
+                        double distance = monacheMetric(predictor_s,
+                                                        forecast,
+                                                        analog,
+                                                        t_init,
+                                                        i);
+
+                        if (found < N_NEIGHBORS)
+                        {
+                            nearest[found].window_id = analog;
+                            nearest[found].distance = distance;
+                            found++;
+                            if (found == N_NEIGHBORS)
+                                qsort(nearest, N_NEIGHBORS, sizeof(NearPoint), compare_near_point);
+                        }
+                        else if (distance < nearest[0].distance)
+                        {
+                            nearest[0].window_id = analog;
+                            nearest[0].distance = distance;
+                            qsort(nearest, N_NEIGHBORS, sizeof(NearPoint), compare_near_point);
+                        }
+                    }
+                    printf("------------------------------------------------------------------\n");
+                    printf("Posição: %i\n", forecast);
+
+                    for (int i = 0; i < found; i++)
+                    {
+                        printf("| P%i W_ID: %i D: %.2f ", i, nearest[i].window_id, nearest[i].distance);
+                    }
+                    printf("\n");
+
+                    free(nearest);
+                }
+            }
+        }
+    }
 }
